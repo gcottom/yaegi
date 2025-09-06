@@ -493,6 +493,10 @@ func (interp *Interpreter) resizeFrame() {
 // Eval evaluates Go code represented as a string. Eval returns the last result
 // computed by the interpreter, and a non nil error in case of failure.
 func (interp *Interpreter) Eval(src string) (res reflect.Value, err error) {
+	lock := new(sync.Mutex)
+	if err := DownloadNonStandardPackages(src, interp, nil, lock); err != nil {
+		return res, fmt.Errorf("failed to download non-standard packages: %w", err)
+	}
 	return interp.eval(src, "", true)
 }
 

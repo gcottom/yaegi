@@ -381,40 +381,56 @@ func (e *Extractor) importPath(pkgIdent, importPath string) (string, error) {
 		return "", err
 	}
 
-	dirPath := filepath.Join(wd, pkgIdent)
-	_, err = os.Stat(dirPath)
-	if err != nil && !os.IsNotExist(err) {
-		return "", err
-	}
-	if err != nil {
-		if pkgIdent != "" && pkgIdent[0] == '.' {
-			// pkgIdent is definitely a relative path, not a package name, and it does not exist
-			return "", err
-		}
-		// pkgIdent might be a valid stdlib package name. So we leave that responsibility to the caller now.
-		return pkgIdent, nil
-	}
-
-	// local import
+	// If an explicit import path was provided, use it.
 	if importPath != "" {
 		return importPath, nil
 	}
 
-	modPath := filepath.Join(dirPath, "go.mod")
-	_, err = os.Stat(modPath)
-	if os.IsNotExist(err) {
+	// Determine if pkgIdent refers to a local filesystem path.
+	isLocal := filepath.IsAbs(pkgIdent) || strings.HasPrefix(pkgIdent, "./") || strings.HasPrefix(pkgIdent, "../")
+	if !isLocal {
+		// Not a local path: treat pkgIdent as an import path (e.g., stdlib like "time").
+		return pkgIdent, nil
+	}
+
+	// Resolve the absolute path to the package directory.
+	abs := pkgIdent
+	if !filepath.IsAbs(abs) {
+		abs = filepath.Join(wd, pkgIdent)
+	}
+	st, err := os.Stat(abs)
+	if err != nil {
+		return "", err
+	}
+	if !st.IsDir() {
+		return "", fmt.Errorf("%s is not a directory", abs)
+	}
+
+	// Walk up from the package directory to find the nearest go.mod
+	var modFile string
+	cur := abs
+	for {
+		candidate := filepath.Join(cur, "go.mod")
+		if st, err := os.Stat(candidate); err == nil && !st.IsDir() {
+			modFile = candidate
+			break
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur { // reached filesystem root
+			break
+		}
+		cur = parent
+	}
+	if modFile == "" {
 		return "", errors.New("no go.mod found, and no import path specified")
 	}
+
+	f, err := os.Open(modFile)
 	if err != nil {
 		return "", err
 	}
-	f, err := os.Open(modPath)
-	if err != nil {
-		return "", err
-	}
-	defer func() {
-		_ = f.Close()
-	}()
+	defer func() { _ = f.Close() }()
+
 	sc := bufio.NewScanner(f)
 	var l string
 	for sc.Scan() {
@@ -431,8 +447,17 @@ func (e *Extractor) importPath(pkgIdent, importPath string) (string, error) {
 	if parts[0] != "module" {
 		return "", errors.New(`invalid first line in go.mod, no "module" found`)
 	}
+	modulePath := parts[1]
 
-	return parts[1], nil
+	// Compute the relative path from the module root to the package directory.
+	moduleDir := filepath.Dir(modFile)
+	rel, err := filepath.Rel(moduleDir, abs)
+	if err != nil {
+		return "", err
+	}
+	// Compose the full import path and normalize separators.
+	ipp := path.Join(modulePath, filepath.ToSlash(rel))
+	return ipp, nil
 }
 
 // Extract writes to rw a Go package with all the symbols found at pkgIdent.
@@ -478,7 +503,7 @@ func GetMinor(part string) string {
 	return minor
 }
 
-const defaultMinorVersion = 22
+const defaultMinorVersion = 24
 
 func genBuildTags() (string, error) {
 	version := runtime.Version()
@@ -489,20 +514,20 @@ func genBuildTags() (string, error) {
 
 	minorRaw := GetMinor(parts[1])
 
-	currentGoVersion := parts[0] + "." + minorRaw
-
 	minor, err := strconv.Atoi(minorRaw)
 	if err != nil {
 		return "", fmt.Errorf("failed to parse version: %w", err)
 	}
 
-	// Only append an upper bound if we are not on the latest go
+	// Cap build tags to the repository baseline go1.%d (defaultMinorVersion)
+	// so that generated stdlib wrappers remain compatible with the baseline,
+	// even when generating with newer toolchains.
 	if minor >= defaultMinorVersion {
-		return currentGoVersion, nil
+		return parts[0] + "." + strconv.Itoa(defaultMinorVersion), nil
 	}
 
+	currentGoVersion := parts[0] + "." + minorRaw
 	nextGoVersion := parts[0] + "." + strconv.Itoa(minor+1)
-
 	return currentGoVersion + ",!" + nextGoVersion, nil
 }
 
